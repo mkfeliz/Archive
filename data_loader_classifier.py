@@ -15,7 +15,8 @@ CLASS_NAMES = [
     "SOLARLIKE",
 ]
 
-def load_dataset(root="light_data/keplerq9v3", normalize=True, nan_strategy="interpolate"):
+def load_dataset(root="light_data/keplerq9v3", normalize=True, nan_strategy="interpolate", 
+                 split_ratios=(0.7, 0.15, 0.15), seed=42):
     """
     Load light curve dataset with SSM-aware NaN handling.
     
@@ -27,6 +28,12 @@ def load_dataset(root="light_data/keplerq9v3", normalize=True, nan_strategy="int
             - "forward_fill": Carry forward last valid value
             - "zero": Replace with 0 (NOT recommended for SSMs)
             - "mean": Replace with local mean
+        split_ratios: (train, val, test) ratios. Set to None for no split.
+        seed: Random seed for reproducible splits
+    
+    Returns:
+        If split_ratios is None: (X, y)
+        If split_ratios is tuple: ((X_train, y_train), (X_val, y_val), (X_test, y_test))
     """
     xs = []
     ys = []
@@ -91,7 +98,49 @@ def load_dataset(root="light_data/keplerq9v3", normalize=True, nan_strategy="int
     X = jnp.asarray(xpad)           # (N, T)
     y = jnp.asarray(np.array(ys))   # (N,)
     
-    return X, y
+    # Split data if requested
+    if split_ratios is None:
+        return X, y
+    
+    # Validate split ratios
+    assert len(split_ratios) == 3, "split_ratios must be (train, val, test)"
+    assert abs(sum(split_ratios) - 1.0) < 1e-6, "split_ratios must sum to 1.0"
+    
+    # Stratified split to maintain class balance
+    n_samples = X.shape[0]
+    indices = np.arange(n_samples)
+    
+    # Shuffle with seed for reproducibility
+    rng = np.random.RandomState(seed)
+    rng.shuffle(indices)
+    
+    # Calculate split points
+    train_ratio, val_ratio, test_ratio = split_ratios
+    train_end = int(n_samples * train_ratio)
+    val_end = train_end + int(n_samples * val_ratio)
+    
+    # Split indices
+    train_idx = indices[:train_end]
+    val_idx = indices[train_end:val_end]
+    test_idx = indices[val_end:]
+    
+    # Create splits
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+    
+    print(f"\n📊 Dataset Split:")
+    print(f"  - Train: {len(train_idx)} samples ({100*train_ratio:.1f}%)")
+    print(f"  - Val:   {len(val_idx)} samples ({100*val_ratio:.1f}%)")
+    print(f"  - Test:  {len(test_idx)} samples ({100*test_ratio:.1f}%)")
+    
+    # Print class distribution
+    print(f"\n📈 Class Distribution (Train set):")
+    for class_id, cname in enumerate(CLASS_NAMES):
+        count = (y_train == class_id).sum()
+        print(f"  - {cname:20s}: {count:5d} samples")
+    
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
 
 
 def _interpolate_nans(flux):

@@ -22,33 +22,44 @@ def make_batches(X, y, batch_size, key, mask=None):
 
 
 def main():
-    # Load with INTERPOLATION (best for SSMs)
-    # Options: "interpolate", "forward_fill", "mean", "zero"
-    X, y = load_dataset("light_data/keplerq9v3", 
-                        normalize=True, 
-                        nan_strategy="interpolate")
+    # Load with proper train/val/test split
+    (X_train, y_train), (X_val, y_val), (X_test, y_test) = load_dataset(
+        "light_data/keplerq9v3", 
+        normalize=True, 
+        nan_strategy="interpolate",
+        split_ratios=(0.7, 0.15, 0.15),  # 70% train, 15% val, 15% test
+        seed=42
+    )
     
-    # Diagnostic checks
-    print("X finite:", bool(jnp.isfinite(X).all()))
-    print("y finite:", bool(jnp.isfinite(y).all()))
-    print("X min/max:", float(jnp.nanmin(X)), float(jnp.nanmax(X)))
-    print("Any NaNs in X:", bool(jnp.isnan(X).any()))
-    print("Any infs in X:", bool(jnp.isinf(X).any()))
+    # Diagnostic checks on training set
+    print("X_train finite:", bool(jnp.isfinite(X_train).all()))
+    print("y_train finite:", bool(jnp.isfinite(y_train).all()))
+    print("X_train min/max:", float(jnp.nanmin(X_train)), float(jnp.nanmax(X_train)))
+    print("Any NaNs in X_train:", bool(jnp.isnan(X_train).any()))
+    print("Any infs in X_train:", bool(jnp.isinf(X_train).any()))
     
     # Final safety check
-    if jnp.isnan(X).any() or jnp.isinf(X).any():
+    if jnp.isnan(X_train).any() or jnp.isinf(X_train).any():
         print("⚠️  WARNING: Still have NaN/inf after loading, applying emergency cleanup")
-        X = jnp.nan_to_num(X, nan=0.0, posinf=1e4, neginf=-1e4)
+        X_train = jnp.nan_to_num(X_train, nan=0.0, posinf=1e4, neginf=-1e4)
+        X_val = jnp.nan_to_num(X_val, nan=0.0, posinf=1e4, neginf=-1e4)
+        X_test = jnp.nan_to_num(X_test, nan=0.0, posinf=1e4, neginf=-1e4)
     
     # Use shorter training windows
     seq_len = 512
-    T = X.shape[1]
+    T = X_train.shape[1]
     if T <= seq_len:
         raise ValueError(f"Sequence too short: T={T}, need > {seq_len}")
     
-    # Crop a fixed window
-    X = X[:, :seq_len]               # (N, L)
-    X = jnp.expand_dims(X, -1)       # (N, L, 1)
+    # Crop all sets to same window
+    X_train = X_train[:, :seq_len]
+    X_val = X_val[:, :seq_len]
+    X_test = X_test[:, :seq_len]
+    
+    # Add channel dimension
+    X_train = jnp.expand_dims(X_train, -1)  # (N, L, 1)
+    X_val = jnp.expand_dims(X_val, -1)
+    X_test = jnp.expand_dims(X_test, -1)
     
     # OPTIONAL: Create attention mask to distinguish real data from padding
     # This tells the model which timesteps are real vs padded
@@ -131,16 +142,30 @@ def main():
         
         return params_tree2, st2, opt_st2, loss, acc
     
+    @eqx.filter_jit
+    def eval_step(params_tree, static_tree, st, xb, yb, k):
+        """Evaluation without gradient computation"""
+        loss, (st2, acc) = loss_and_state(params_tree, static_tree, st, xb, yb, k)
+        return loss, acc
+    
     epochs = 100
     batch_size = 16
     
+    best_val_acc = 0.0
+    best_params = params
+    patience = 10
+    patience_counter = 0
+    
+    print("\n🚀 Starting Training...")
+    
     for ep in range(1, epochs + 1):
+        # Training
         key, k_epoch = jax.random.split(key)
         total_loss = 0.0
         total_acc = 0.0
         steps = 0
         
-        for xb, yb, _ in make_batches(X, y, batch_size, k_epoch):
+        for xb, yb, _ in make_batches(X_train, y_train, batch_size, k_epoch):
             key, k_step = jax.random.split(key)
             params, state, opt_state, loss, acc = train_step(
                 params, static, state, opt_state, xb, yb, k_step
@@ -150,7 +175,65 @@ def main():
             total_acc += float(acc)
             steps += 1
         
-        print(f"Epoch {ep}: loss={total_loss/steps:.4f}  acc={total_acc/steps:.4f}")
+        train_loss = total_loss / steps
+        train_acc = total_acc / steps
+        
+        # Validation
+        val_loss = 0.0
+        val_acc = 0.0
+        val_steps = 0
+        
+        key, k_val = jax.random.split(key)
+        for xb, yb, _ in make_batches(X_val, y_val, batch_size, k_val):
+            key, k_step = jax.random.split(key)
+            loss, acc = eval_step(params, static, state, xb, yb, k_step)
+            val_loss += float(loss)
+            val_acc += float(acc)
+            val_steps += 1
+        
+        val_loss /= val_steps
+        val_acc /= val_steps
+        
+        # Print progress
+        print(f"Epoch {ep:3d}: "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+        
+        # Early stopping check
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_params = params
+            patience_counter = 0
+            print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\n⏹️  Early stopping triggered (no improvement for {patience} epochs)")
+                break
+    
+    # Test set evaluation with best model
+    print("\n📊 Evaluating on Test Set...")
+    params = best_params  # Use best model from validation
+    
+    test_loss = 0.0
+    test_acc = 0.0
+    test_steps = 0
+    
+    key, k_test = jax.random.split(key)
+    for xb, yb, _ in make_batches(X_test, y_test, batch_size, k_test):
+        key, k_step = jax.random.split(key)
+        loss, acc = eval_step(params, static, state, xb, yb, k_step)
+        test_loss += float(loss)
+        test_acc += float(acc)
+        test_steps += 1
+    
+    test_loss /= test_steps
+    test_acc /= test_steps
+    
+    print(f"\n🎯 Final Test Results:")
+    print(f"  - Test Loss: {test_loss:.4f}")
+    print(f"  - Test Accuracy: {test_acc:.4f}")
+    print(f"  - Best Val Accuracy: {best_val_acc:.4f}")
     
     # Save
     final_model = eqx.combine(params, static)
